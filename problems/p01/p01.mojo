@@ -15,6 +15,7 @@ fn add_10(
 ):
     i = thread_idx.x
     # FILL ME IN (roughly 1 line)
+    output[i] = a[i] + 10
 
 
 # ANCHOR_END: add_10
@@ -22,6 +23,7 @@ fn add_10(
 
 def main():
     with DeviceContext() as ctx:
+        print("Device: ",ctx.device_info)
         out = ctx.enqueue_create_buffer[dtype](SIZE)
         out = out.enqueue_fill(0)
         a = ctx.enqueue_create_buffer[dtype](SIZE)
