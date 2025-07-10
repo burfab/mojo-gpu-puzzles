@@ -27,14 +27,40 @@ fn conv_1d_simple[
     global_i = block_dim.x * block_idx.x + thread_idx.x
     local_i = thread_idx.x
     # FILL ME IN (roughly 14 lines)
+    shared_a = tb[dtype]().row_major[SIZE]().shared().alloc()
+    shared_b = tb[dtype]().row_major[CONV]().shared().alloc()
+
+    if global_i < a.dim(0):
+        shared_a[local_i] = a[global_i]
+    else: 
+        shared_a[local_i] = 0
+
+    if local_i < shared_b.dim(0):
+        shared_b[local_i] = b[local_i]
+
+    barrier()
+    
+    # From tutorial:
+    var s : shared_a.element_type = 0
+    #s : SIMD[dtype, Layout(1,1).size()] = 0
+    
+    if global_i < SIZE:
+        #add parameter to unroll loop
+        @parameter
+        for i in range(CONV):
+            if i + local_i < shared_a.dim(0):
+                s = s + shared_a[i + local_i] * shared_b[i]
+        
+        output[global_i] = s
+
 
 
 # ANCHOR_END: conv_1d_simple
 
 # ANCHOR: conv_1d_block_boundary
-alias SIZE_2 = 15
+alias SIZE_2 = 1_000_001
 alias CONV_2 = 4
-alias BLOCKS_PER_GRID_2 = (2, 1)
+alias BLOCKS_PER_GRID_2 = (125_000, 1)
 alias THREADS_PER_BLOCK_2 = (TPB, 1)
 alias in_2_layout = Layout.row_major(SIZE_2)
 alias out_2_layout = Layout.row_major(SIZE_2)
@@ -51,7 +77,37 @@ fn conv_1d_block_boundary[
     global_i = block_dim.x * block_idx.x + thread_idx.x
     local_i = thread_idx.x
     # FILL ME IN (roughly 18 lines)
+    shared_a = tb[dtype]().row_major[TPB + CONV_2 - 1]().shared().alloc()
+    shared_b = tb[dtype]().row_major[CONV_2]().shared().alloc()
 
+    #round up in a compile time friendly way
+    alias L = ((TPB+CONV_2-1) + TPB - 1)//TPB
+    @parameter
+    for load_iter in range(L):
+        offset = TPB * load_iter
+        if local_i+offset < shared_a.dim(0):
+            if global_i+offset < SIZE_2:
+                shared_a[local_i+offset] = a[global_i+offset]
+            else: 
+                shared_a[local_i+offset] = 0
+        else: 
+            shared_a[local_i+offset] = 0
+
+    if local_i < shared_b.dim(0):
+        shared_b[local_i] = b[local_i]
+    barrier()
+
+    var s : shared_a.element_type = 0
+    #s : SIMD[dtype, Layout(1,1).size()] = 0
+    
+    if global_i < SIZE_2:
+        #add parameter to unroll loop
+        @parameter
+        for i in range(CONV_2):
+            if i + local_i < shared_a.dim(0):
+                s = s + shared_a[i + local_i] * shared_b[i]
+        
+        output[global_i] = s
 
 # ANCHOR_END: conv_1d_block_boundary
 
