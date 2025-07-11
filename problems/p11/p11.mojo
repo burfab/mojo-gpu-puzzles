@@ -58,9 +58,9 @@ fn conv_1d_simple[
 # ANCHOR_END: conv_1d_simple
 
 # ANCHOR: conv_1d_block_boundary
-alias SIZE_2 = 1_000_001
+alias SIZE_2 = 15
 alias CONV_2 = 4
-alias BLOCKS_PER_GRID_2 = (125_000, 1)
+alias BLOCKS_PER_GRID_2 = (2, 1)
 alias THREADS_PER_BLOCK_2 = (TPB, 1)
 alias in_2_layout = Layout.row_major(SIZE_2)
 alias out_2_layout = Layout.row_major(SIZE_2)

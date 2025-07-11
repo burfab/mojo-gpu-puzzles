@@ -2,10 +2,14 @@ from sys import sizeof, argv
 from testing import assert_equal
 from gpu.host import DeviceContext
 
+from gpu.memory import async_copy_wait_all
+from layout.layout_tensor import copy_dram_to_sram_async
+from layout.tensor_builder import LayoutTensorBuild as tb
+
 # ANCHOR: naive_matmul
 from gpu import thread_idx, block_idx, block_dim, barrier
 from layout import Layout, LayoutTensor
-from layout.tensor_builder import LayoutTensorBuild as tb
+
 
 
 alias TPB = 3
@@ -26,6 +30,12 @@ fn naive_matmul[
     row = block_dim.y * block_idx.y + thread_idx.y
     col = block_dim.x * block_idx.x + thread_idx.x
     # FILL ME IN (roughly 6 lines)
+    if row < size and col < size:
+        s : output.element_type = 0
+        @parameter
+        for i in range(size):
+            s += (a[row, i] * b[i,col])
+        output[row, col] = s
 
 
 # ANCHOR_END: naive_matmul
@@ -44,17 +54,76 @@ fn single_block_matmul[
     local_row = thread_idx.y
     local_col = thread_idx.x
     # FILL ME IN (roughly 12 lines)
+    shared_a = tb[dtype]().row_major[TPB, TPB]().shared().alloc()
+    shared_b = tb[dtype]().row_major[TPB, TPB]().shared().alloc()
+
+    if row < size and col < size:
+        shared_a[local_row, local_col] = a[row, col]
+        shared_b[local_row, local_col] = b[row, col]
+    else:
+        shared_a[local_row, local_col] = 0
+        shared_b[local_row, local_col] = 0
+    barrier()
+
+    s : output.element_type = 0
+    @parameter
+    for i in range(TPB):
+        s += (shared_a[row, i] * shared_b[i,col])
+    if row < size and col < size:
+        output[row, col] = s
 
 
 # ANCHOR_END: single_block_matmul
 
 # ANCHOR: matmul_tiled
-alias SIZE_TILED = 9
+alias SIZE_TILED = 8
 alias BLOCKS_PER_GRID_TILED = (3, 3)  # each block convers 3x3 elements
 alias THREADS_PER_BLOCK_TILED = (TPB, TPB)
 alias layout_tiled = Layout.row_major(SIZE_TILED, SIZE_TILED)
 
 
+fn matmul_tiled_manual_tiling[
+    layout: Layout, size: Int
+](
+    output: LayoutTensor[mut=False, dtype, layout],
+    a: LayoutTensor[mut=False, dtype, layout],
+    b: LayoutTensor[mut=False, dtype, layout],
+):
+    local_row = thread_idx.y
+    local_col = thread_idx.x
+    tiled_row = block_idx.y * TPB + thread_idx.y
+    tiled_col = block_idx.x * TPB + thread_idx.x
+    # FILL ME IN (roughly 20 lines)
+    shared_a = tb[dtype]().row_major[TPB, TPB]().shared().alloc()
+    shared_b = tb[dtype]().row_major[TPB, TPB]().shared().alloc()
+
+
+    s : output.element_type = 0
+    
+    @parameter
+    for stride in range((size+TPB-1) // TPB):
+        load_col = local_col + stride * TPB
+        if tiled_row < size and load_col < size:
+            shared_a[local_row, local_col] = a[tiled_row, load_col]
+        else: 
+            shared_a[local_row, local_col] = 0
+
+        load_row = local_row + stride * TPB
+        if load_row < size and tiled_col < size:
+            shared_b[local_row, local_col] = b[load_row, tiled_col]
+        else: 
+            shared_b[local_row, local_col] = 0
+
+        barrier()
+        @parameter
+        for i in range(TPB):
+            s += shared_a[local_row, i] * shared_b[i, local_col]
+
+        barrier()
+
+    if tiled_row < size and tiled_col < size:
+        output[tiled_row, tiled_col] = s
+    
 fn matmul_tiled[
     layout: Layout, size: Int
 ](
@@ -67,6 +136,39 @@ fn matmul_tiled[
     tiled_row = block_idx.y * TPB + thread_idx.y
     tiled_col = block_idx.x * TPB + thread_idx.x
     # FILL ME IN (roughly 20 lines)
+    shared_a = tb[dtype]().row_major[TPB, TPB]().shared().alloc().fill(0)
+    shared_b = tb[dtype]().row_major[TPB, TPB]().shared().alloc().fill(0)
+
+    tile_o = output.tile[TPB, TPB](block_idx.y, block_idx.x)
+
+
+    alias load_a_layout = Layout.row_major(1, TPB)  # Coalesced loading
+    alias load_b_layout = Layout.row_major(1, TPB)  # Coalesced loading 
+    
+    s : output.element_type = 0
+
+    @parameter
+    for stride in range((size+TPB-1) // TPB):
+        tile_a = a.tile[TPB, TPB](block_idx.y, stride)
+        tile_b = b.tile[TPB, TPB](stride, block_idx.x)
+
+        # Asynchronously copy tiles to shared memory with consistent orientation
+        copy_dram_to_sram_async[thread_layout=load_a_layout](shared_a, tile_a)
+        copy_dram_to_sram_async[thread_layout=load_b_layout](shared_b, tile_b)
+
+        # Wait for all async copies to complete
+        async_copy_wait_all()
+        barrier()
+
+        @parameter
+        for i in range(TPB):
+            s += shared_a[local_row, i] * shared_b[i, local_col]
+
+        barrier()
+
+    if tiled_row < size and tiled_col < size:
+        tile_o[local_row, local_col] = s
+
 
 
 # ANCHOR_END: matmul_tiled
@@ -75,12 +177,12 @@ fn matmul_tiled[
 def main():
     with DeviceContext() as ctx:
         if len(argv()) != 2 or argv()[1] not in [
-            "--simple",
+            "--naive",
             "--single-block",
             "--tiled",
         ]:
             raise Error(
-                "Expected one argument: '--simple', '--single-block', or"
+                "Expected one argument: '--naive', '--single-block', or"
                 " '--tiled'"
             )
         size = SIZE_TILED if argv()[1] == "--tiled" else SIZE

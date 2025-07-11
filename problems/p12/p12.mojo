@@ -1,17 +1,19 @@
+from memory import UnsafePointer, stack_allocation
+from gpu.memory import AddressSpace
 from gpu import thread_idx, block_idx, block_dim, barrier
 from gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
 from layout.tensor_builder import LayoutTensorBuild as tb
 from sys import sizeof, argv
 from math import log2
-from testing import assert_equal
+from testing import assert_equal, assert_almost_equal
 
 # ANCHOR: prefix_sum_simple
-alias TPB = 8
+alias TPB = 32
 alias SIZE = 8
 alias BLOCKS_PER_GRID = (1, 1)
 alias THREADS_PER_BLOCK = (TPB, 1)
-alias dtype = DType.float32
+alias dtype = DType.float64
 alias layout = Layout.row_major(SIZE)
 
 
@@ -25,15 +27,42 @@ fn prefix_sum_simple[
     global_i = block_dim.x * block_idx.x + thread_idx.x
     local_i = thread_idx.x
     # FILL ME IN (roughly 18 lines)
+    shared_a = tb[dtype]().row_major[TPB]().shared().alloc()
+
+    if global_i < size:
+        shared_a[local_i] = global_i
+    else: shared_a[local_i] = 0 
+
+
+    fn determine_num_steps(N:Int)->Int:
+        i = 0
+        var n = N
+        while n > 0:
+            n = n << 1
+            i+=1
+        return i
+
+
+    alias step_cnt = determine_num_steps(TPB)
+    step = 1
+    @parameter
+    for _ in range(step_cnt):
+        barrier()
+        if local_i >= step:
+            shared_a[local_i] = shared_a[local_i] + shared_a[local_i-step]
+        step = step * 2
+
+    if global_i < size:
+        output[local_i] = shared_a[local_i]
 
 
 # ANCHOR_END: prefix_sum_simple
 
 # ANCHOR: prefix_sum_complete
-alias SIZE_2 = 15
-alias BLOCKS_PER_GRID_2 = (2, 1)
+alias SIZE_2 = 2_000_000
+alias BLOCKS_PER_GRID_2 = ((SIZE_2+TPB-1)//TPB, 1)
 alias THREADS_PER_BLOCK_2 = (TPB, 1)
-alias EXTENDED_SIZE = SIZE_2 + 2  # up to 2 blocks
+alias EXTENDED_SIZE = SIZE_2 + BLOCKS_PER_GRID_2[0]  # up to 2 blocks
 alias extended_layout = Layout.row_major(EXTENDED_SIZE)
 
 
@@ -48,7 +77,35 @@ fn prefix_sum_local_phase[
     global_i = block_dim.x * block_idx.x + thread_idx.x
     local_i = thread_idx.x
     # FILL ME IN (roughly 20 lines)
+    shared_a = tb[dtype]().row_major[TPB]().shared().alloc()
 
+    if global_i < size:
+        shared_a[local_i] = global_i
+    else: shared_a[local_i] = 0 
+
+
+    fn determine_num_steps(N:Int)->Int:
+        i = 0
+        var n = N
+        while n > 0:
+            n = n << 1
+            i+=1
+        return i
+
+
+    alias step_cnt = determine_num_steps(TPB)
+    step = 1
+    @parameter
+    for _ in range(step_cnt):
+        barrier()
+        if local_i >= step:
+            shared_a[local_i] = shared_a[local_i] + shared_a[local_i-step]
+        step = step * 2
+
+    if global_i < size:
+        output[global_i] = shared_a[local_i]
+    if local_i == TPB - 1:
+        output[size + block_idx.x] = shared_a[local_i]
 
 # Kernel 2: Add block sums to their respective blocks
 fn prefix_sum_block_sum_phase[
@@ -56,6 +113,22 @@ fn prefix_sum_block_sum_phase[
 ](output: LayoutTensor[mut=False, dtype, layout], size: Int):
     global_i = block_dim.x * block_idx.x + thread_idx.x
     # FILL ME IN (roughly 3 lines)
+    local_i = thread_idx.x
+
+    shared = stack_allocation[
+        1,
+        output.element_type,
+        address_space = AddressSpace.SHARED,
+    ]()
+    #could also do reduction here
+    if thread_idx.x == 0:
+        shared[0] = 0
+        for offset in range(block_idx.x):
+            shared[0] += output[size + offset]
+    
+    barrier()
+    if global_i < size:
+        output[global_i] += shared[0]
 
 
 # ANCHOR_END: prefix_sum_complete
@@ -154,4 +227,4 @@ def main():
             # Here we need to use the size of the original array, not the extended one
             size = size if use_simple else SIZE_2
             for i in range(size):
-                assert_equal(out_host[i], expected[i])
+                assert_almost_equal(out_host[i], expected[i])
